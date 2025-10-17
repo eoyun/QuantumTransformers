@@ -1,207 +1,182 @@
-from typing import Optional
+"""Training utilities implemented with PyTorch."""
+from __future__ import annotations
+
+import copy
 import time
+from typing import Optional, Tuple
 
-import numpy.typing as npt
-import jax
-import jax.numpy as jnp
-import flax.linen
-import flax.training.train_state
-import optax
-from sklearn.metrics import roc_auc_score, roc_curve, auc
+import numpy as np
+import torch
+from sklearn.metrics import auc, roc_auc_score, roc_curve
+from torch import nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
-
 
 TQDM_BAR_FORMAT = '{l_bar}{bar:10}{r_bar}{bar:-10b}'
 
 
-class TrainState(flax.training.train_state.TrainState):
-    # See https://flax.readthedocs.io/en/latest/guides/dropout.html.
-    key: jax.random.KeyArray  # type: ignore
-
-
-@jax.jit
-def train_step(state: TrainState, inputs: jax.Array, labels: jax.Array, key: jax.random.KeyArray) -> TrainState:
-    """
-    Performs a single training step on the given batch of inputs and labels.
-
-    Args:
-        state: The current training state.
-        inputs: The batch of inputs.
-        labels: The batch of labels.
-        key: The random key to use.
-
-    Returns:
-        The updated training state.
-    """
-    key, dropout_key = jax.random.split(key=key)
-    dropout_train_key = jax.random.fold_in(key=dropout_key, data=state.step)
-
-    def loss_fn(params):
-        logits = state.apply_fn(
-            {'params': params},
-            x=inputs,
-            train=True,
-            rngs={'dropout': dropout_train_key}
-        )
-        if logits.shape[1] <= 2:
-            if logits.shape[1] == 2:
-                logits = logits[:, 1]
-            loss = optax.sigmoid_binary_cross_entropy(logits=logits, labels=labels).mean()
-        else:
-            loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits, labels=labels).mean()
-        # return loss, logits
-        return loss
-    # grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    # (loss, logits), grads = grad_fn(state.params)
-    grad_fn = jax.grad(loss_fn)
-    grads = grad_fn(state.params)
-    state = state.apply_gradients(grads=grads)
-    return state
-
-
-@jax.jit
-def eval_step(state: TrainState, inputs: jax.Array, labels: jax.Array) -> tuple[float, jax.Array]:
-    """
-    Performs a single evaluation step on the given batch of inputs and labels.
-
-    Args:
-        state: The current training state.
-        inputs: The batch of inputs.
-        labels: The batch of labels.
-
-    Returns:
-        loss: The loss on the given batch.
-        logits: The logits on the given batch.
-    """
-    logits = state.apply_fn(
-        {'params': state.params},
-        x=inputs,
-        train=False,
-        rngs={'dropout': state.key}
-    )
-    if logits.shape[1] <= 2:
-        if logits.shape[1] == 2:
-            logits = logits[:, 1]
-        loss = optax.sigmoid_binary_cross_entropy(logits=logits, labels=labels).mean()
+def _as_tensor(array, device: torch.device) -> torch.Tensor:
+    if isinstance(array, torch.Tensor):
+        tensor = array.to(device)
     else:
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits, labels=labels).mean()
-    return loss, logits
+        tensor = torch.as_tensor(array, device=device)
+    if tensor.dtype == torch.float64:
+        tensor = tensor.float()
+    return tensor
 
 
-def evaluate(state: TrainState, eval_dataloader, num_classes: int,
-             tqdm_desc: Optional[str] = None, debug: bool = False) -> tuple[float, float, npt.ArrayLike, npt.ArrayLike]:
-    """
-    Evaluates the model given the current training state on the given dataloader.
+def _prepare_binary_logits(logits: torch.Tensor) -> torch.Tensor:
+    if logits.ndim == 1:
+        return logits
+    if logits.shape[-1] == 1:
+        return logits.squeeze(-1)
+    if logits.shape[-1] == 2:
+        return logits[:, 1]
+    raise ValueError("Binary classification expects logits with 1 or 2 outputs")
 
-    Args:
-        state: The current training state.
-        eval_dataloader: The dataloader to evaluate on.
-        num_classes: The number of classes.
-        tqdm_desc: The description to use for the tqdm progress bar. If None, no progress bar is shown.
-        debug: Whether to print extra information for debugging.
 
-    Returns:
-        eval_loss: The loss.
-        eval_auc: The AUC.
-    """
-    logits, labels = [], []
-    eval_loss = 0.0
-    with tqdm(total=len(eval_dataloader), desc=tqdm_desc, unit="batch", bar_format=TQDM_BAR_FORMAT, disable=tqdm_desc is None) as progress_bar:
-        for inputs_batch, labels_batch in eval_dataloader:
-            loss_batch, logits_batch = eval_step(state, inputs_batch, labels_batch)
-            logits.append(logits_batch)
-            labels.append(labels_batch)
-            eval_loss += loss_batch
+def _prepare_binary_targets(labels: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    target = labels.float()
+    if target.shape != reference.shape:
+        target = target.view(reference.shape)
+    return target
+
+
+def evaluate(
+    model: nn.Module,
+    dataloader,
+    num_classes: int,
+    device: torch.device,
+    criterion: nn.Module,
+    *,
+    tqdm_desc: Optional[str] = None,
+    debug: bool = False,
+) -> Tuple[float, float, np.ndarray, np.ndarray]:
+    was_training = model.training
+    model.eval()
+
+    losses = []
+    logits_batches = []
+    label_batches = []
+
+    try:
+        total = len(dataloader)
+    except TypeError:
+        total = None
+
+    progress_bar = tqdm(
+        total=total,
+        desc=tqdm_desc,
+        unit="batch",
+        bar_format=TQDM_BAR_FORMAT,
+        disable=tqdm_desc is None,
+    )
+
+    with torch.no_grad():
+        for inputs_batch, labels_batch in dataloader:
+            inputs = _as_tensor(inputs_batch, device)
+            labels = _as_tensor(labels_batch, device)
+
+            outputs = model(inputs)
+            if num_classes == 2:
+                logits_for_loss = _prepare_binary_logits(outputs)
+                targets = _prepare_binary_targets(labels, logits_for_loss)
+                loss = criterion(logits_for_loss, targets)
+                logits_to_store = logits_for_loss
+                labels_to_store = targets
+            else:
+                loss = criterion(outputs, labels.long())
+                logits_to_store = outputs
+                labels_to_store = labels
+
+            losses.append(loss.item())
+            logits_batches.append(logits_to_store.detach().cpu())
+            label_batches.append(labels_to_store.detach().cpu())
             progress_bar.update(1)
-        eval_loss /= len(eval_dataloader)
-        logits = jnp.concatenate(logits)  # type: ignore
-        y_true = jnp.concatenate(labels)  # type: ignore
-        if debug:
-            print(f"logits = {logits}")
-        if num_classes == 2:
-            y_pred = [jax.nn.sigmoid(l) for l in logits]
-        else:
-            y_pred = [jax.nn.softmax(l) for l in logits]
-        if debug:
-            print(f"y_pred = {y_pred}")
-            print(f"y_true = {y_true}")
-        if num_classes == 2:
-            eval_fpr, eval_tpr, _ = roc_curve(y_true, y_pred)
-            eval_auc = auc(eval_fpr, eval_tpr)
-        else:
-            eval_fpr, eval_tpr = [], []
-            eval_auc = roc_auc_score(y_true, y_pred, multi_class='ovr')
-        progress_bar.set_postfix_str(f"Loss = {eval_loss:.4f}, AUC = {eval_auc:.3f}")
-    return eval_loss, eval_auc, eval_fpr, eval_tpr
+
+    progress_bar.close()
+
+    avg_loss = float(np.mean(losses)) if losses else 0.0
+    logits = torch.cat(logits_batches) if logits_batches else torch.empty(0)
+    labels = torch.cat(label_batches) if label_batches else torch.empty(0)
+
+    if debug:
+        print(f"logits = {logits}")
+
+    if num_classes == 2 and logits.numel() > 0:
+        probs = torch.sigmoid(logits).cpu().numpy()
+        y_true = labels.float().view(-1).cpu().numpy()
+        eval_fpr, eval_tpr, _ = roc_curve(y_true, probs)
+        eval_auc = auc(eval_fpr, eval_tpr)
+    elif num_classes > 2 and logits.numel() > 0:
+        probs = torch.softmax(logits, dim=-1).cpu().numpy()
+        y_true = labels.long().cpu().numpy()
+        eval_auc = roc_auc_score(y_true, probs, multi_class='ovr')
+        eval_fpr, eval_tpr = np.array([]), np.array([])
+    else:
+        eval_auc = 0.0
+        eval_fpr, eval_tpr = np.array([]), np.array([])
+
+    if debug:
+        print(f"y_true = {labels}")
+
+    if was_training:
+        model.train()
+
+    return avg_loss, eval_auc, eval_fpr, eval_tpr
 
 
-def train_and_evaluate(model: flax.linen.Module, train_dataloader, val_dataloader, test_dataloader, num_classes: int,
-                       num_epochs: int, lrs_peak_value: float = 1e-3, lrs_warmup_steps: int = 5_000, lrs_decay_steps: int = 50_000,
-                       seed: int = 42, use_ray: bool = False, debug: bool = False) -> tuple[float, float, npt.ArrayLike, npt.ArrayLike]:
-    """
-    Trains the given model on the given dataloaders for the given hyperparameters.
-
-    The progress and evaluation results are printed to stdout.
-
-    Args:
-        model: The model to train.
-        train_dataloader: The dataloader for the training set.
-        val_dataloader: The dataloader for the validation set.
-        num_classes: The number of classes.
-        num_epochs: The number of epochs to train for.
-        learning_rate: The learning rate to use.
-        seed: The seed to use for reproducibility.
-        use_ray: Whether to use Ray for logging.
-        debug: Whether to print extra information for debugging.
-
-    Returns:
-        None
-    """
+def train_and_evaluate(
+    model: nn.Module,
+    train_dataloader,
+    val_dataloader,
+    test_dataloader,
+    num_classes: int,
+    num_epochs: int,
+    *,
+    lrs_peak_value: float = 1e-3,
+    lrs_warmup_steps: int = 5_000,
+    lrs_decay_steps: int = 50_000,
+    seed: int = 42,
+    use_ray: bool = False,
+    debug: bool = False,
+    device: Optional[str] = None,
+) -> dict:
     if use_ray:
         from ray.air import session
 
-    root_key = jax.random.PRNGKey(seed=seed)
-    root_key, params_key, train_key = jax.random.split(key=root_key, num=3)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    dummy_batch = next(iter(train_dataloader))[0]
-    input_shape = dummy_batch[0].shape
-    input_dtype = dummy_batch[0].dtype
-    batch_size = len(dummy_batch)
-    root_key, input_key = jax.random.split(key=root_key)
-    if jnp.issubdtype(input_dtype, jnp.floating):
-        dummy_batch = jax.random.uniform(key=input_key, shape=(batch_size,) + tuple(input_shape), dtype=input_dtype)
-    elif jnp.issubdtype(input_dtype, jnp.integer):
-        dummy_batch = jax.random.randint(key=input_key, shape=(batch_size,) + tuple(input_shape), minval=0, maxval=100, dtype=input_dtype)
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device_obj = torch.device(device)
+
+    model = model.to(device_obj)
+
+    num_parameters = sum(p.numel() for p in model.parameters())
+    print(f"Number of parameters = {num_parameters}")
+
+    if num_classes == 2:
+        criterion = nn.BCEWithLogitsLoss()
     else:
-        raise ValueError(f"Unsupported dtype {input_dtype}")
+        criterion = nn.CrossEntropyLoss()
 
-    variables = model.init(params_key, dummy_batch, train=False)
+    optimizer = AdamW(model.parameters(), lr=lrs_peak_value)
 
-    if debug:
-        print(jax.tree_map(lambda x: x.shape, variables))
-    print(f"Number of parameters = {sum(x.size for x in jax.tree_util.tree_leaves(variables))}")
+    schedulers = []
+    milestones = []
+    if lrs_warmup_steps > 0:
+        schedulers.append(LinearLR(optimizer, start_factor=0.0, end_factor=1.0, total_iters=lrs_warmup_steps))
+        milestones.append(lrs_warmup_steps)
+    schedulers.append(CosineAnnealingLR(optimizer, T_max=max(1, lrs_decay_steps), eta_min=0.0))
+    scheduler = SequentialLR(optimizer, schedulers=schedulers, milestones=milestones) if len(schedulers) > 1 else schedulers[0]
 
-    learning_rate_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=lrs_peak_value,
-        warmup_steps=lrs_warmup_steps,
-        decay_steps=lrs_decay_steps,
-        end_value=0.0
-    )
+    best_val_auc = 0.0
+    best_epoch = 0
+    best_state = None
 
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=learning_rate_schedule),
-    )
-
-    state = TrainState.create(
-        apply_fn=model.apply,
-        params=variables['params'],
-        key=train_key,
-        tx=optimizer
-    )
-
-    best_val_auc, best_epoch, best_state = 0.0, 0, None
     total_train_time = 0.0
     start_time = time.time()
 
@@ -212,48 +187,113 @@ def train_and_evaluate(model: flax.linen.Module, train_dataloader, val_dataloade
         'val_aucs': [],
         'test_loss': 0.0,
         'test_auc': 0.0,
-        'test_fpr': [],
-        'test_tpr': [],
+        'test_fpr': np.array([]),
+        'test_tpr': np.array([]),
     }
 
     for epoch in range(num_epochs):
-        with tqdm(total=len(train_dataloader), desc=f"Epoch {epoch+1:3}/{num_epochs}", unit="batch", bar_format=TQDM_BAR_FORMAT) as progress_bar:
-            epoch_train_time = time.time()
-            for inputs_batch, labels_batch in train_dataloader:
-                state = train_step(state, inputs_batch, labels_batch, train_key)
-                progress_bar.update(1)
-            epoch_train_time = time.time() - epoch_train_time
-            total_train_time += epoch_train_time
+        model.train()
+        try:
+            train_total = len(train_dataloader)
+        except TypeError:
+            train_total = None
 
-            train_loss, train_auc, _, _ = evaluate(state, train_dataloader, num_classes, tqdm_desc=None, debug=debug)
-            val_loss, val_auc, _, _ = evaluate(state, val_dataloader, num_classes, tqdm_desc=None, debug=debug)
-            progress_bar.set_postfix_str(f"Loss = {val_loss:.4f}, AUC = {val_auc:.3f}, Train time = {epoch_train_time:.2f}s")
+        progress_bar = tqdm(
+            total=train_total,
+            desc=f"Epoch {epoch + 1:3}/{num_epochs}",
+            unit="batch",
+            bar_format=TQDM_BAR_FORMAT,
+        )
+        epoch_train_time = time.time()
 
-            metrics['train_losses'].append(train_loss)
-            metrics['val_losses'].append(val_loss)
-            metrics['train_aucs'].append(train_auc)
-            metrics['val_aucs'].append(val_auc)
-            if val_auc > best_val_auc:
-                best_val_auc = val_auc
-                best_epoch = epoch + 1
-                best_state = state
-            if use_ray:
-                session.report({'val_loss': val_loss, 'val_auc': val_auc, 'best_val_auc': best_val_auc, 'best_epoch': best_epoch})
-    metrics['train_losses'] = jnp.array(metrics['train_losses'])
-    metrics['val_losses'] = jnp.array(metrics['val_losses'])
-    metrics['train_aucs'] = jnp.array(metrics['train_aucs'])
-    metrics['val_aucs'] = jnp.array(metrics['val_aucs'])
+        for inputs_batch, labels_batch in train_dataloader:
+            inputs = _as_tensor(inputs_batch, device_obj)
+            labels = _as_tensor(labels_batch, device_obj)
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+
+            if num_classes == 2:
+                logits_for_loss = _prepare_binary_logits(outputs)
+                targets = _prepare_binary_targets(labels, logits_for_loss)
+                loss = criterion(logits_for_loss, targets)
+            else:
+                loss = criterion(outputs, labels.long())
+
+            loss.backward()
+            optimizer.step()
+
+            if scheduler is not None:
+                scheduler.step()
+
+            progress_bar.update(1)
+
+        epoch_train_time = time.time() - epoch_train_time
+        total_train_time += epoch_train_time
+
+        train_loss, train_auc, _, _ = evaluate(
+            model,
+            train_dataloader,
+            num_classes,
+            device_obj,
+            criterion,
+            tqdm_desc=None,
+            debug=debug,
+        )
+        val_loss, val_auc, _, _ = evaluate(
+            model,
+            val_dataloader,
+            num_classes,
+            device_obj,
+            criterion,
+            tqdm_desc=None,
+            debug=debug,
+        )
+
+        progress_bar.set_postfix_str(
+            f"Loss = {val_loss:.4f}, AUC = {val_auc:.3f}, Train time = {epoch_train_time:.2f}s"
+        )
+        progress_bar.close()
+
+        metrics['train_losses'].append(train_loss)
+        metrics['val_losses'].append(val_loss)
+        metrics['train_aucs'].append(train_auc)
+        metrics['val_aucs'].append(val_auc)
+
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
+            best_epoch = epoch + 1
+            best_state = copy.deepcopy(model.state_dict())
+
+        if use_ray:
+            session.report({'val_loss': val_loss, 'val_auc': val_auc, 'best_val_auc': best_val_auc, 'best_epoch': best_epoch})
+
+    metrics['train_losses'] = np.array(metrics['train_losses'])
+    metrics['val_losses'] = np.array(metrics['val_losses'])
+    metrics['train_aucs'] = np.array(metrics['train_aucs'])
+    metrics['val_aucs'] = np.array(metrics['val_aucs'])
 
     print(f"Best validation AUC = {best_val_auc:.3f} at epoch {best_epoch}")
     print(f"Total training time = {total_train_time:.2f}s, total time (including evaluations) = {time.time() - start_time:.2f}s")
 
-    # Evaluate on test set using the best model
-    assert best_state is not None
-    test_loss, test_auc, test_fpr, test_tpr = evaluate(best_state, test_dataloader, num_classes, tqdm_desc="Testing")
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    test_loss, test_auc, test_fpr, test_tpr = evaluate(
+        model,
+        test_dataloader,
+        num_classes,
+        device_obj,
+        criterion,
+        tqdm_desc="Testing",
+        debug=debug,
+    )
     metrics['test_loss'] = test_loss
     metrics['test_auc'] = test_auc
     metrics['test_fpr'] = test_fpr
     metrics['test_tpr'] = test_tpr
+
     if use_ray:
         session.report({'test_loss': test_loss, 'test_auc': test_auc})
+
     return metrics

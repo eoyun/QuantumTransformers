@@ -1,75 +1,88 @@
-from typing import Callable
+"""Quantum layers implemented with PennyLane for PyTorch models."""
+from __future__ import annotations
 
-import tensorcircuit as tc
-import jax.numpy as jnp
-import flax.linen
+from typing import Callable, Optional, Sequence
 
-K = tc.set_backend("jax")
+import inspect
 
-
-def angle_embedding(c: tc.Circuit, inputs):
-    num_qubits = inputs.shape[-1]
-
-    for j in range(num_qubits):
-        c.rx(j, theta=inputs[j])
+import pennylane as qml
+import torch
+from torch import nn
 
 
-def basic_vqc(c: tc.Circuit, inputs, weights):
-    num_qubits = inputs.shape[-1]
-    num_qlayers = weights.shape[-2]
-
-    for i in range(num_qlayers):
-        for j in range(num_qubits):
-            c.rx(j, theta=weights[i, j])
-        if num_qubits == 2:
-            c.cnot(0, 1)
-        elif num_qubits > 2:
-            for j in range(num_qubits):
-                c.cnot(j, (j + 1) % num_qubits)
+def angle_embedding(inputs: torch.Tensor, wires: Sequence[int]) -> None:
+    """Applies angle embedding to the given ``inputs`` on ``wires``."""
+    qml.templates.AngleEmbedding(inputs, wires=wires)
 
 
-def get_quantum_layer_circuit(inputs, weights,
-                              embedding: Callable = angle_embedding, vqc: Callable = basic_vqc):
+def basic_vqc(weights: torch.Tensor, wires: Sequence[int]) -> None:
+    """Applies a basic entangling variational circuit."""
+    qml.templates.BasicEntanglerLayers(weights, wires=wires)
+
+
+def default_circuit(inputs: torch.Tensor, weights: torch.Tensor, wires: Sequence[int]) -> list:
+    """Default circuit used by :class:`QuantumLayer`.
+
+    It applies :func:`angle_embedding` followed by :func:`basic_vqc` and
+    returns a list of ``Z`` expectation values, one per wire.
     """
-    Equivalent to the following PennyLane circuit:
-        def circuit(inputs, weights):
-            qml.templates.AngleEmbedding(inputs, wires=range(num_qubits))
-            qml.templates.BasicEntanglerLayers(weights, wires=range(num_qubits))
+    angle_embedding(inputs, wires=wires)
+    basic_vqc(weights, wires=wires)
+    return [qml.expval(qml.PauliZ(wire)) for wire in wires]
+
+
+class QuantumLayer(nn.Module):
+    """A PennyLane-backed quantum layer compatible with PyTorch modules."""
+
+    def __init__(
+        self,
+        num_qubits: int,
+        w_shape: tuple[int, ...] = (1,),
+        circuit: Optional[Callable] = None,
+        *,
+        device_name: str = "default.qubit",
+        shots: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.num_qubits = num_qubits
+        self.w_shape = w_shape
+        self._circuit = circuit or default_circuit
+        self._expects_wires = "wires" in inspect.signature(self._circuit).parameters
+
+        self._device = qml.device(device_name, wires=num_qubits, shots=shots)
+
+        def qnode_fn(inputs, weights):
+            if self._expects_wires:
+                return self._circuit(inputs, weights, wires=range(self.num_qubits))
+            return self._circuit(inputs, weights)
+
+        qnode = qml.QNode(qnode_fn, self._device, interface="torch", diff_method="best")
+        weight_shapes = {"weights": w_shape + (num_qubits,)}
+        self.layer = qml.qnn.TorchLayer(qnode, weight_shapes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        original_shape = x.shape
+        x_flat = x.reshape(-1, original_shape[-1])
+        outputs = self.layer(x_flat)
+        outputs = outputs.to(dtype=x.dtype)
+        outputs = outputs.reshape(*original_shape[:-1], outputs.shape[-1])
+        return outputs
+
+
+def get_circuit(
+    embedding: Callable[[torch.Tensor, Sequence[int]], None] = angle_embedding,
+    vqc: Callable[[torch.Tensor, Sequence[int]], None] = basic_vqc,
+) -> Callable:
+    """Returns a callable that can be used with :class:`QuantumLayer`.
+
+    The returned callable expects three positional arguments ``(inputs, weights, wires)``
+    and applies the provided ``embedding`` and ``vqc`` templates before measuring a list of
+    ``Z`` expectation values, one per wire.
     """
 
-    num_qubits = inputs.shape[-1]
+    def circuit(inputs, weights, wires):
+        embedding(inputs, wires=wires)
+        vqc(weights, wires=wires)
+        return [qml.expval(qml.PauliZ(wire)) for wire in wires]
 
-    c = tc.Circuit(num_qubits)
-    embedding(c, inputs)
-    vqc(c, inputs, weights)
-
-    return c
-
-
-def get_circuit(embedding: Callable = angle_embedding, vqc: Callable = basic_vqc,
-                torch_interface: bool = False):
-    def qpred(inputs, weights):
-        c = get_quantum_layer_circuit(inputs, weights, embedding, vqc)
-        return K.real(jnp.array([c.expectation_ps(z=[i]) for i in range(weights.shape[1])]))
-
-    qpred_batch = K.vmap(qpred, vectorized_argnums=0)
-    if torch_interface:
-        qpred_batch = tc.interfaces.torch_interface(qpred_batch, jit=True)
-
-    return qpred_batch
-
-
-class QuantumLayer(flax.linen.Module):
-    circuit: Callable
-    num_qubits: int
-    w_shape: tuple = (1,)
-
-    @flax.linen.compact
-    def __call__(self, x):
-        shape = x.shape
-        x = jnp.reshape(x, (-1, shape[-1]))
-        w = self.param('w', flax.linen.initializers.xavier_normal(), self.w_shape + (self.num_qubits,))
-        x = self.circuit(x, w)
-        x = jnp.concatenate(x, axis=-1)
-        x = jnp.reshape(x, tuple(shape))
-        return x
+    return circuit

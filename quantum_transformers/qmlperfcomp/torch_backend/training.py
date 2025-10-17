@@ -26,9 +26,9 @@ def train_and_evaluate(model: torch.nn.Module, train_dataloader: torch.utils.dat
             for inputs, labels in train_dataloader:
                 inputs, labels = inputs.to(device), labels.to(device)
                 if num_classes == 2:
-                    labels = labels.float()
+                    labels = labels.float().view(-1)
                 else:
-                    labels = labels.long()
+                    labels = labels.long().view(-1)
 
                 operation_start_time = time.time()
 
@@ -40,8 +40,10 @@ def train_and_evaluate(model: torch.nn.Module, train_dataloader: torch.utils.dat
 
                 outputs = model(inputs)
 
-                if num_classes == 2 and outputs.shape[1] == 2:
+                if num_classes == 2 and outputs.ndim > 1 and outputs.shape[1] == 2:
                     outputs = outputs[:, 1]
+                elif outputs.ndim > 1 and outputs.shape[-1] == 1:
+                    outputs = outputs.view(outputs.size(0))
 
                 if verbose:
                     print(f" Forward ({time.time()-operation_start_time:.2f}s)")
@@ -76,19 +78,21 @@ def train_and_evaluate(model: torch.nn.Module, train_dataloader: torch.utils.dat
                 for inputs, labels in valid_dataloader:
                     inputs, labels = inputs.to(device), labels.to(device)
                     if num_classes == 2:
-                        labels = labels.float()
+                        labels = labels.float().view(-1)
                     else:
-                        labels = labels.long()
+                        labels = labels.long().view(-1)
                     outputs = model(inputs)
                     val_loss += criterion(outputs, labels).item()
                     if num_classes == 2:
-                        if outputs.shape[1] == 2:
+                        if outputs.ndim > 1 and outputs.shape[1] == 2:
                             outputs = outputs[:, 1]
+                        elif outputs.ndim > 1 and outputs.shape[-1] == 1:
+                            outputs = outputs.view(outputs.size(0))
                         probabilities = torch.sigmoid(outputs)
                     else:
                         probabilities = torch.softmax(outputs, dim=1)
-                    y_true.extend(labels.tolist())
-                    y_pred.extend(probabilities.tolist())
+                    y_true.extend(labels.detach().cpu().tolist())
+                    y_pred.extend(probabilities.detach().cpu().tolist())
 
             val_loss /= len(valid_dataloader)
             val_auc = 100.0 * roc_auc_score(y_true, y_pred, multi_class='ovr')
