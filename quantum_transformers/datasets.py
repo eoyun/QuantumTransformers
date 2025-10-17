@@ -1,224 +1,313 @@
 import os
 import tarfile
+import urllib.request
+from collections import Counter
+from pathlib import Path
+from typing import Iterable, Sequence
 
-import numpy as np
 import gdown
-import tensorflow_datasets as tfds
-import tensorflow as tf
-# Ensure TF does not see GPU and grab all GPU memory.
-tf.config.set_visible_devices([], device_type='GPU')
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset, random_split
+import torchvision.transforms as T
+from torchvision import datasets as tv_datasets
 
-options = tf.data.Options()
-options.deterministic = True
+_PAD_TOKEN = "[PAD]"
+_UNK_TOKEN = "[UNK]"
+_START_TOKEN = "[START]"
+_END_TOKEN = "[END]"
+_IMDB_URL = "https://ai.stanford.edu/~amaas/data/sentiment/aclImdb_v1.tar.gz"
+_IMDB_ARCHIVE = "aclImdb_v1.tar.gz"
+_IMDB_DIR = "aclImdb"
 
 
-class NumPyFolderDataset(tfds.core.GeneratorBasedBuilder):
-    """
-    A dataset consisting of NumPy arrays stored in folders (one folder per class).
-    """
-    VERSION = tfds.core.Version('1.0.0')  # to avoid ValueError
+class _ChannelLastWrapper(Dataset):
+    def __init__(self, dataset: Dataset) -> None:
+        self.dataset = dataset
 
-    def __init__(self, name, img_shape, num_classes, extracted_data_path=None, gdrive_id=None, **kwargs):
-        """Creates a NumPyFolderDataset."""
-        self.name = name
-        self.img_shape = img_shape
-        self.num_classes = num_classes
-        self.extracted_data_path = extracted_data_path
-        self.gdrive_id = gdrive_id
-        super().__init__(**kwargs)
+    def __len__(self) -> int:  # type: ignore[override]
+        return len(self.dataset)
 
-    def _info(self) -> tfds.core.DatasetInfo:
-        """Returns the dataset metadata."""
-        return self.dataset_info_from_configs(
-            features=tfds.features.FeaturesDict({
-                'image': tfds.features.Tensor(shape=self.img_shape, dtype=np.float32),
-                'label': tfds.features.ClassLabel(num_classes=self.num_classes),
-            }),
-            supervised_keys=('image', 'label')
-        )
-
-    def _split_generators(self, _):
-        """Returns SplitGenerators."""
-        if self.extracted_data_path is not None:
-            print(f'Using existing data at {self.extracted_data_path}')
-            dataset_path = self.extracted_data_path
-        elif self.gdrive_id is not None:
-            os.makedirs(f'{self.data_dir}/{self.name}')
-            gdown.download(id=self.gdrive_id, output=f'{self.data_dir}/{self.name}.tar.xz', quiet=False)
-            with tarfile.open(f'{self.data_dir}/{self.name}.tar.xz', 'r:xz') as f:
-                print(f'Extracting {self.name}.tar.xz to {self.data_dir}')
-                f.extractall(self.data_dir)
-            os.remove(f'{self.data_dir}/{self.name}.tar.xz')
-            dataset_path = f'{self.data_dir}/{self.name}'
+    def __getitem__(self, idx):  # type: ignore[override]
+        image, label = self.dataset[idx]
+        if isinstance(image, torch.Tensor):
+            if image.ndim == 3:
+                image = image.permute(1, 2, 0)
+        elif isinstance(image, np.ndarray):
+            tensor = torch.from_numpy(image)
+            if tensor.ndim == 3:
+                tensor = tensor.permute(1, 2, 0)
+            image = tensor
         else:
-            raise ValueError('Either extracted_data_path or gdrive_id must be provided')
-
-        dataset_path = tfds.core.Path(dataset_path)
-        return {
-            'train': self._generate_examples(dataset_path / 'train'),
-            'test': self._generate_examples(dataset_path / 'test'),
-        }
-
-    def _generate_examples(self, path):
-        """Yields examples."""
-        class_names = {c: i for i, c in enumerate(sorted([f.name for f in path.glob('*')]))}
-        for class_folder in path.glob('*'):
-            for f in class_folder.glob('*.npy'):
-                try:
-                    image = np.load(f).astype(np.float32)
-                    if image.shape != self.img_shape:
-                        # Try to transpose if channels are in the wrong place
-                        if image.shape[0] == self.img_shape[-1]:
-                            image = np.transpose(image, (1, 2, 0))
-                        elif image.shape[-1] == self.img_shape[0]:
-                            image = np.transpose(image, (2, 0, 1))
-                        else:
-                            raise ValueError(f'Unexpected image shape {image.shape} for {f}')
-                    yield f"{class_folder.name}_{f.name}", {
-                        'image': image,
-                        'label': class_names[class_folder.name],
-                    }
-                except FileNotFoundError as e:
-                    print(e)
+            image = torch.as_tensor(image)
+            if image.ndim == 3:
+                image = image.permute(1, 2, 0)
+        return image, label
 
 
-def datasets_to_dataloaders(train_dataset, val_dataset, test_dataset, batch_size, drop_remainder=True, transform=None):
-    # Shuffle train dataset
-    train_dataset = train_dataset.shuffle(10_000, reshuffle_each_iteration=True)
+class _NpyImageDataset(Dataset):
+    def __init__(self, samples: Sequence[tuple[Path, int]], img_shape: tuple[int, int, int]) -> None:
+        self.samples = list(samples)
+        self.img_shape = img_shape
 
-    # Batch
-    train_dataset = train_dataset.batch(batch_size, drop_remainder=drop_remainder)
-    val_dataset = val_dataset.batch(batch_size, drop_remainder=drop_remainder)
-    test_dataset = test_dataset.batch(batch_size, drop_remainder=drop_remainder)
+    def __len__(self) -> int:  # type: ignore[override]
+        return len(self.samples)
 
-    # Transform
-    if transform is not None:
-        train_dataset = train_dataset.map(transform, num_parallel_calls=tf.data.AUTOTUNE)
-        val_dataset = val_dataset.map(transform, num_parallel_calls=tf.data.AUTOTUNE)
-        test_dataset = test_dataset.map(transform, num_parallel_calls=tf.data.AUTOTUNE)
-
-    # Prefetch
-    train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
-    val_dataset = val_dataset.prefetch(tf.data.AUTOTUNE)
-    test_dataset = test_dataset.prefetch(tf.data.AUTOTUNE)
-
-    # Convert to NumPy for JAX
-    return tfds.as_numpy(train_dataset), tfds.as_numpy(val_dataset), tfds.as_numpy(test_dataset)
+    def __getitem__(self, idx):  # type: ignore[override]
+        path, label = self.samples[idx]
+        image = np.load(path).astype(np.float32)
+        expected = self.img_shape
+        if image.shape != expected:
+            if image.ndim == 3 and image.shape[0] == expected[-1] and image.shape[1:] == expected[:2]:
+                image = np.transpose(image, (1, 2, 0))
+            elif image.ndim == 3 and image.shape[-1] == expected[0] and image.shape[:2] == expected[1:]:
+                image = np.transpose(image, (1, 0, 2))
+            else:
+                raise ValueError(f"Unexpected image shape {image.shape} for {path}")
+        tensor = torch.from_numpy(image)
+        return tensor, int(label)
 
 
-def get_mnist_dataloaders(data_dir: str = '~/data', batch_size: int = 1, drop_remainder: bool = True):
-    """
-    Returns dataloaders for the MNIST dataset (computer vision, multi-class classification)
+class _IMDBTokenizer:
+    def __call__(self, text: str) -> list[str]:
+        return _tokenize(text)
 
-    Information about the dataset: https://www.tensorflow.org/datasets/catalog/mnist
-    """
+
+class _IMDBDataset(Dataset):
+    def __init__(
+        self,
+        examples: Sequence[tuple[str, int]],
+        vocab_lookup: dict[str, int],
+        max_seq_len: int,
+    ) -> None:
+        self.examples = list(examples)
+        self.vocab_lookup = vocab_lookup
+        self.max_seq_len = max_seq_len
+        self.pad_idx = vocab_lookup[_PAD_TOKEN]
+        self.unk_idx = vocab_lookup[_UNK_TOKEN]
+        self.start_idx = vocab_lookup[_START_TOKEN]
+        self.end_idx = vocab_lookup[_END_TOKEN]
+
+    def __len__(self) -> int:  # type: ignore[override]
+        return len(self.examples)
+
+    def __getitem__(self, idx):  # type: ignore[override]
+        text, label = self.examples[idx]
+        tokens = _tokenize(text)
+        token_ids = [self.start_idx]
+        for token in tokens:
+            token_ids.append(self.vocab_lookup.get(token, self.unk_idx))
+            if len(token_ids) >= self.max_seq_len - 1:
+                break
+        token_ids.append(self.end_idx)
+        if len(token_ids) < self.max_seq_len:
+            token_ids.extend([self.pad_idx] * (self.max_seq_len - len(token_ids)))
+        else:
+            token_ids = token_ids[:self.max_seq_len]
+        input_tensor = torch.tensor(token_ids, dtype=torch.long)
+        return input_tensor, int(label)
+
+
+def _tokenize(text: str) -> list[str]:
+    tokens = []
+    current = []
+    for char in text.lower():
+        if char.isalnum():
+            current.append(char)
+        else:
+            if current:
+                tokens.append("".join(current))
+                current.clear()
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _download_file(url: str, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        return
+    with urllib.request.urlopen(url) as response, open(destination, "wb") as output:
+        output.write(response.read())
+
+
+def _ensure_imdb_dataset(root: Path) -> Path:
+    dataset_dir = root / _IMDB_DIR
+    if dataset_dir.exists():
+        return dataset_dir
+    archive_path = root / _IMDB_ARCHIVE
+    print(f"Downloading IMDB dataset to {archive_path}")
+    _download_file(_IMDB_URL, archive_path)
+    print(f"Extracting {archive_path}")
+    with tarfile.open(archive_path, "r:gz") as tar:
+        tar.extractall(path=root)
+    archive_path.unlink(missing_ok=True)
+    return dataset_dir
+
+
+def _load_imdb_split(split_dir: Path) -> list[tuple[str, int]]:
+    examples: list[tuple[str, int]] = []
+    for label_name, label_value in ("pos", 1), ("neg", 0):
+        label_dir = split_dir / label_name
+        for path in sorted(label_dir.glob("*.txt")):
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            examples.append((text, label_value))
+    return examples
+
+
+def _build_imdb_vocab(examples: Iterable[tuple[str, int]], max_vocab_size: int) -> list[str]:
+    counter: Counter[str] = Counter()
+    for text, _ in examples:
+        counter.update(_tokenize(text))
+    reserved = [_PAD_TOKEN, _UNK_TOKEN, _START_TOKEN, _END_TOKEN]
+    most_common = [token for token, _ in counter.most_common(max(0, max_vocab_size - len(reserved)))]
+    return reserved + most_common
+
+
+def _numpy_folder_samples(dataset_path: Path) -> list[tuple[Path, int]]:
+    samples: list[tuple[Path, int]] = []
+    class_dirs = sorted([d for d in dataset_path.iterdir() if d.is_dir()])
+    class_map = {directory.name: index for index, directory in enumerate(class_dirs)}
+    for class_dir in class_dirs:
+        for path in sorted(class_dir.glob("*.npy")):
+            samples.append((path, class_map[class_dir.name]))
+    return samples
+
+
+def _split_samples(samples: list[tuple[Path, int]], val_fraction: float, seed: int = 0):
+    rng = np.random.default_rng(seed)
+    indices = np.arange(len(samples))
+    rng.shuffle(indices)
+    split_idx = int(len(samples) * (1 - val_fraction))
+    train_indices = indices[:split_idx]
+    val_indices = indices[split_idx:]
+    train_samples = [samples[i] for i in train_indices]
+    val_samples = [samples[i] for i in val_indices]
+    return train_samples, val_samples
+
+
+def _make_dataloader(dataset: Dataset, batch_size: int, *, shuffle: bool, drop_last: bool):
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last)
+
+
+def get_mnist_dataloaders(data_dir: str = "~/data", batch_size: int = 1, drop_remainder: bool = True):
     data_dir = os.path.expanduser(data_dir)
-
-    # Load datasets
-    train_dataset, val_dataset, test_dataset = tfds.load(name='mnist',
-                                                         split=['train[:90%]', 'train[90%:]', 'test'], as_supervised=True, data_dir=data_dir, shuffle_files=True)
-    train_dataset, val_dataset, test_dataset = train_dataset.with_options(options), val_dataset.with_options(options), test_dataset.with_options(options)
-    print("Cardinalities (train, val, test):", train_dataset.cardinality().numpy(), val_dataset.cardinality().numpy(), test_dataset.cardinality().numpy())
-
-    def normalize_image(image, label):
-        image = tf.cast(image, tf.float32) / 255.0
-        return (image - 0.1307) / 0.3081, label
-
-    return datasets_to_dataloaders(train_dataset, val_dataset, test_dataset, batch_size,
-                                   drop_remainder=drop_remainder, transform=normalize_image)
-
-
-def get_electron_photon_dataloaders(data_dir: str = '~/data', batch_size: int = 1, drop_remainder: bool = True):
-    """
-    Returns dataloaders for the electron-photon dataset (computer vision - particle physics, binary classification)
-
-    Information about the dataset: https://arxiv.org/abs/1807.11916
-    """
-    data_dir = os.path.expanduser(data_dir)
-
-    # Load datasets
-    electron_photon_builder = NumPyFolderDataset(data_dir=data_dir, name="electron-photon", gdrive_id="1VAqGQaMS5jSWV8gTXw39Opz-fNMsDZ8e",
-                                                 img_shape=(32, 32, 2), num_classes=2)
-    electron_photon_builder.download_and_prepare(download_dir=data_dir)
-    train_dataset, val_dataset, test_dataset = electron_photon_builder.as_dataset(split=['train[:90%]', 'train[90%:]', 'test'], as_supervised=True, shuffle_files=True)
-    train_dataset, val_dataset, test_dataset = train_dataset.with_options(options), val_dataset.with_options(options), test_dataset.with_options(options)
-    print("Cardinalities (train, val, test):", train_dataset.cardinality().numpy(), val_dataset.cardinality().numpy(), test_dataset.cardinality().numpy())
-
-    return datasets_to_dataloaders(train_dataset, val_dataset, test_dataset, batch_size,
-                                   drop_remainder=drop_remainder)
-
-
-def get_quark_gluon_dataloaders(data_dir: str = '~/data', batch_size: int = 1, drop_remainder: bool = True):
-    """
-    Returns dataloaders for the quark-gluon dataset (computer vision - particle physics, binary classification)
-
-    Information about the dataset: https://arxiv.org/abs/1902.08276
-    """
-    data_dir = os.path.expanduser(data_dir)
-
-    # Load datasets
-    quark_gluon_builder = NumPyFolderDataset(data_dir=data_dir, name="quark-gluon", gdrive_id="1PL2YEr5V__zUZVuUfGdUvFTkE9ULHayz",
-                                             img_shape=(125, 125, 3), num_classes=2)
-    quark_gluon_builder.download_and_prepare(download_dir=data_dir)
-    train_dataset, val_dataset, test_dataset = quark_gluon_builder.as_dataset(split=['train[:90%]', 'train[90%:]', 'test'], as_supervised=True, shuffle_files=True)
-    train_dataset, val_dataset, test_dataset = train_dataset.with_options(options), val_dataset.with_options(options), test_dataset.with_options(options)
-    print("Cardinalities (train, val, test):", train_dataset.cardinality().numpy(), val_dataset.cardinality().numpy(), test_dataset.cardinality().numpy())
-
-    return datasets_to_dataloaders(train_dataset, val_dataset, test_dataset, batch_size,
-                                   drop_remainder=drop_remainder)
-
-
-def get_medmnist_dataloaders(dataset: str, data_dir: str = '~/data', batch_size: int = 1, drop_remainder: bool = True):
-    """
-    Returns dataloaders for a MedMNIST dataset
-
-    Information about the dataset: https://medmnist.com/
-    """
-    raise NotImplementedError
-
-
-def get_imdb_dataloaders(data_dir: str = '~/data', batch_size: int = 1, drop_remainder: bool = True,
-                         max_vocab_size: int = 20_000, max_seq_len: int = 512):
-    """
-    Returns dataloaders for the IMDB sentiment analysis dataset (natural language processing, binary classification),
-    as well as the vocabulary and tokenizer.
-
-    Information about the dataset: https://www.tensorflow.org/datasets/catalog/imdb_reviews
-    """
-    import tensorflow_text as tf_text
-    from tensorflow_text.tools.wordpiece_vocab.bert_vocab_from_dataset import bert_vocab_from_dataset
-
-    data_dir = os.path.expanduser(data_dir)
-
-    # Load datasets
-    train_dataset, val_dataset, test_dataset = tfds.load(name='imdb_reviews',
-                                                         split=['train[:90%]', 'train[90%:]', 'test'], as_supervised=True, data_dir=data_dir, shuffle_files=True)
-    train_dataset, val_dataset, test_dataset = train_dataset.with_options(options), val_dataset.with_options(options), test_dataset.with_options(options)
-    print("Cardinalities (train, val, test):", train_dataset.cardinality().numpy(), val_dataset.cardinality().numpy(), test_dataset.cardinality().numpy())
-
-    # Build vocabulary and tokenizer
-    bert_tokenizer_params = dict(lower_case=True)
-    vocab = bert_vocab_from_dataset(
-        train_dataset.batch(10_000).prefetch(tf.data.AUTOTUNE).map(lambda x, _: x),
-        vocab_size=max_vocab_size,
-        reserved_tokens=["[PAD]", "[UNK]", "[START]", "[END]"],
-        bert_tokenizer_params=bert_tokenizer_params
+    transform = T.Compose([
+        T.ToTensor(),
+    ])
+    train_dataset = tv_datasets.MNIST(data_dir, train=True, download=True, transform=transform)
+    test_dataset = tv_datasets.MNIST(data_dir, train=False, download=True, transform=transform)
+    train_len = int(len(train_dataset) * 0.9)
+    val_len = len(train_dataset) - train_len
+    train_subset, val_subset = random_split(
+        train_dataset,
+        [train_len, val_len],
+        generator=torch.Generator().manual_seed(0),
     )
-    vocab_lookup_table = tf.lookup.StaticVocabularyTable(
-        num_oov_buckets=1,
-        initializer=tf.lookup.KeyValueTensorInitializer(keys=vocab,
-                                                        values=tf.range(len(vocab), dtype=tf.int64))  # setting tf.int32 here causes an error
+    train_wrapper = _ChannelLastWrapper(train_subset)
+    val_wrapper = _ChannelLastWrapper(val_subset)
+    test_wrapper = _ChannelLastWrapper(test_dataset)
+    train_loader = _make_dataloader(train_wrapper, batch_size, shuffle=True, drop_last=drop_remainder)
+    val_loader = _make_dataloader(val_wrapper, batch_size, shuffle=False, drop_last=drop_remainder)
+    test_loader = _make_dataloader(test_wrapper, batch_size, shuffle=False, drop_last=drop_remainder)
+    return train_loader, val_loader, test_loader
+
+
+def _ensure_numpy_dataset(data_dir: Path, name: str, gdrive_id: str) -> Path:
+    dataset_dir = data_dir / name
+    if dataset_dir.exists():
+        return dataset_dir
+    data_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = data_dir / f"{name}.tar.xz"
+    print(f"Downloading {name} dataset")
+    gdown.download(id=gdrive_id, output=str(archive_path), quiet=False)
+    print(f"Extracting {archive_path}")
+    with tarfile.open(archive_path, "r:xz") as tar:
+        tar.extractall(path=data_dir)
+    archive_path.unlink(missing_ok=True)
+    return dataset_dir
+
+
+def _numpy_dataloaders(
+    dataset_dir: Path,
+    *,
+    img_shape: tuple[int, int, int],
+    batch_size: int,
+    drop_remainder: bool,
+    val_fraction: float = 0.1,
+) -> tuple[DataLoader, DataLoader, DataLoader]:
+    train_samples = _numpy_folder_samples(dataset_dir / "train")
+    test_samples = _numpy_folder_samples(dataset_dir / "test")
+    train_split, val_split = _split_samples(train_samples, val_fraction=val_fraction)
+    train_dataset = _NpyImageDataset(train_split, img_shape)
+    val_dataset = _NpyImageDataset(val_split, img_shape)
+    test_dataset = _NpyImageDataset(test_samples, img_shape)
+    train_loader = _make_dataloader(train_dataset, batch_size, shuffle=True, drop_last=drop_remainder)
+    val_loader = _make_dataloader(val_dataset, batch_size, shuffle=False, drop_last=drop_remainder)
+    test_loader = _make_dataloader(test_dataset, batch_size, shuffle=False, drop_last=drop_remainder)
+    return train_loader, val_loader, test_loader
+
+
+def get_electron_photon_dataloaders(
+    data_dir: str = "~/data",
+    batch_size: int = 1,
+    drop_remainder: bool = True,
+):
+    data_path = Path(os.path.expanduser(data_dir))
+    dataset_dir = _ensure_numpy_dataset(
+        data_path,
+        name="electron-photon",
+        gdrive_id="1VAqGQaMS5jSWV8gTXw39Opz-fNMsDZ8e",
     )
-    tokenizer = tf_text.BertTokenizer(vocab_lookup_table, **bert_tokenizer_params)
+    return _numpy_dataloaders(
+        dataset_dir,
+        img_shape=(32, 32, 2),
+        batch_size=batch_size,
+        drop_remainder=drop_remainder,
+    )
 
-    def preprocess(text, label):
-        # Tokenize
-        tokens = tokenizer.tokenize(text).merge_dims(-2, -1)
-        # Cast to int32 for compatibility with JAX (note that the vocabulary size is small)
-        tokens = tf.cast(tokens, tf.int32)
-        # Pad (all sequences to the same length so that JAX jit compiles the model only once)
-        padded_inputs, _ = tf_text.pad_model_inputs(tokens, max_seq_length=max_seq_len)
-        return padded_inputs, label
 
-    return datasets_to_dataloaders(train_dataset, val_dataset, test_dataset, batch_size,
-                                   drop_remainder=drop_remainder, transform=preprocess), vocab, tokenizer
+def get_quark_gluon_dataloaders(
+    data_dir: str = "~/data",
+    batch_size: int = 1,
+    drop_remainder: bool = True,
+):
+    data_path = Path(os.path.expanduser(data_dir))
+    dataset_dir = _ensure_numpy_dataset(
+        data_path,
+        name="quark-gluon",
+        gdrive_id="1PL2YEr5V__zUZVuUfGdUvFTkE9ULHayz",
+    )
+    return _numpy_dataloaders(
+        dataset_dir,
+        img_shape=(125, 125, 3),
+        batch_size=batch_size,
+        drop_remainder=drop_remainder,
+    )
+
+
+def get_imdb_dataloaders(
+    data_dir: str = "~/data",
+    batch_size: int = 1,
+    drop_remainder: bool = True,
+    max_vocab_size: int = 20_000,
+    max_seq_len: int = 512,
+):
+    data_path = Path(os.path.expanduser(data_dir))
+    dataset_dir = _ensure_imdb_dataset(data_path)
+    train_examples = _load_imdb_split(dataset_dir / "train")
+    test_examples = _load_imdb_split(dataset_dir / "test")
+    train_len = int(len(train_examples) * 0.9)
+    val_len = len(train_examples) - train_len
+    train_split = train_examples[:train_len]
+    val_split = train_examples[train_len:]
+    vocab = _build_imdb_vocab(train_split, max_vocab_size=max_vocab_size)
+    vocab_lookup = {token: idx for idx, token in enumerate(vocab)}
+    train_dataset = _IMDBDataset(train_split, vocab_lookup, max_seq_len)
+    val_dataset = _IMDBDataset(val_split, vocab_lookup, max_seq_len)
+    test_dataset = _IMDBDataset(test_examples, vocab_lookup, max_seq_len)
+    train_loader = _make_dataloader(train_dataset, batch_size, shuffle=True, drop_last=drop_remainder)
+    val_loader = _make_dataloader(val_dataset, batch_size, shuffle=False, drop_last=drop_remainder)
+    test_loader = _make_dataloader(test_dataset, batch_size, shuffle=False, drop_last=drop_remainder)
+    tokenizer = _IMDBTokenizer()
+    return (train_loader, val_loader, test_loader), vocab, tokenizer

@@ -14,15 +14,11 @@ pennylane = "^0.38.0"
 ipykernel = "^6.25.0"
 jupyterlab = "^4.2.5"
 matplotlib = "^3.7.2"
-tensorflow-datasets = "^4.9.2"
-tensorflow = "^2.14.0"
 ipywidgets = "^8.1.0"
 tqdm = "^4.66.3"
 numpy = "^1.25.2"
 gdown = "^4.7.1"
-qiskit = "^1.4.2"
 pylatexenc = "^2.10"
-tensorflow-text = "^2.14.0"
 ray = {extras = ["tune"], version = "^2.43.0"}
 
 

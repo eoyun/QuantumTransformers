@@ -44,6 +44,16 @@ pip install -e .
 
 After installation, you can run the notebooks in the `notebooks` folder. You can also import the library in your own code (`import quantum_transformers`).
 
+### MNIST Vision Transformer example
+
+The `examples/mnist_classification.py` script trains a compact Vision Transformer on the MNIST digits dataset using the PyTorch training utilities included in this repository. The script downloads the dataset automatically (by default under `~/data`) and reports the final loss, AUC, and accuracy on the held-out test split.
+
+```bash
+python examples/mnist_classification.py --epochs 5 --batch-size 128 --learning-rate 3e-4
+```
+
+Override the arguments as needed to experiment with different hyperparameters or device placements (for example, `--device cuda`).
+
 ## Citation
 
 If you find this project helpful for your research, please cite our [paper](https://doi.org/10.3390/axioms13050323):
