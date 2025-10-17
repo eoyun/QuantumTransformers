@@ -89,41 +89,23 @@ val_loader   = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num
 test_loader  = DataLoader(test_dataset, batch_size=BATCH_SIZE*2, shuffle=False, num_workers=2)
 
 
-from transformers import AutoImageProcessor, AutoModelForImageClassification
-import torch.nn as nn
+from quantum_transformers.transformers import VisionTransformer
 
-# Load pretrained SwinV2 Base model (22k pretraining, 1k fine-tuned)
-os.environ["TRANSFORMERS_CACHE"] = os.getenv("SCRATCH", "/tmp") + "/hf/transformers"
-os.environ["HF_HOME"] = os.environ["TRANSFORMERS_CACHE"]
-
-from transformers import AutoImageProcessor, AutoModelForImageClassification
-
-model_name = "microsoft/swinv2-base-patch4-window12-192-22k"
-#model_name = "microsoft/swinv2-base-patch4-window12to24-192to384-22kto1k-ft"
-
-# 이미 캐시에 받아놨으니 local_files_only=True 로 네트워크 차단
-processor = AutoImageProcessor.from_pretrained(
-    model_name, cache_dir=os.environ["TRANSFORMERS_CACHE"], local_files_only=True
-)
-model = AutoModelForImageClassification.from_pretrained(
-    model_name, cache_dir=os.environ["TRANSFORMERS_CACHE"], local_files_only=True
+# Vision Transformer configuration from the QuantumTransformers library
+vit_config = dict(
+    num_classes=num_classes,
+    patch_size=14,  # 98x98 images -> 7x7 patches
+    hidden_size=256,
+    num_heads=8,
+    num_transformer_blocks=6,
+    mlp_hidden_size=512,
+    dropout=0.1,
+    pos_embedding="learn",
+    classifier="gap",
+    channels_last=False,  # our dataloader provides NCHW tensors
 )
 
-# Replace the classification head
-if hasattr(model, "classifier"):
-    # Hugging Face SwinForImageClassification uses 'classifier' as the final layer
-    in_features = model.classifier.in_features
-    model.classifier = nn.Linear(in_features, num_classes)
-else:
-    # If different attribute (just in case), find the last linear layer
-    in_features = model.classifier.in_features
-    model.classifier = nn.Linear(in_features, num_classes)
-
-# Alternative: We could also initialize a fresh model with desired num_labels:
-# config = AutoConfig.from_pretrained(model_name)
-# config.num_labels = num_classes
-# model = AutoModelForImageClassification.from_pretrained(model_name, config=config)
-# (This would randomly initialize the new head as well.)
+model = VisionTransformer(**vit_config)
 
 # Move model to GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -187,7 +169,7 @@ for epoch in range(1, EPOCHS+1):
         optimizer.zero_grad()
         # Mixed precision forward and loss
         with autocast():
-            logits = model(images).logits  # model outputs with .logits for HF ImageClassification models
+            logits = model(images)
             loss = focal_loss(logits, labels)
         train_losses.append(loss.item())
         # Backpropagation
@@ -214,7 +196,7 @@ for epoch in range(1, EPOCHS+1):
             images = images.to(device)
             labels = labels.to(device)
             with autocast():
-                logits = model(images).logits
+                logits = model(images)
                 loss = focal_loss(logits, labels)
             val_losses.append(loss.item())
             preds = logits.argmax(dim=1)
@@ -257,13 +239,11 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
 
 # Load the best model weights (if needed)
-#best_model = AutoModelForImageClassification.from_pretrained(model_name)
-best_model = AutoModelForImageClassification.from_pretrained(
-    model_name, cache_dir=os.environ["TRANSFORMERS_CACHE"], local_files_only=True
-)
-best_model.classifier = nn.Linear(in_features, num_classes)
-best_model.load_state_dict(torch.load(best_model_path))
+best_model = VisionTransformer(**vit_config)
 best_model.to(device)
+with torch.no_grad():
+    _ = best_model(torch.zeros(1, 3, IMG_SIZE, IMG_SIZE, device=device))
+best_model.load_state_dict(torch.load(best_model_path, map_location=device))
 best_model.eval()
 
 # Get predictions on the test set
@@ -273,7 +253,7 @@ with torch.no_grad():
     for images, labels in test_loader:
         images = images.to(device)
         labels = labels.to(device)
-        logits = best_model(images).logits
+        logits = best_model(images)
         probs = torch.softmax(logits, dim=1)
         y_true.extend(labels.cpu().numpy().tolist())
         y_prob.extend(probs.cpu().numpy().tolist())
