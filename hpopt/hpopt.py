@@ -12,8 +12,7 @@ text_datasets = ['imdb']
 
 def train(config) -> None:
     # Perform imports here to avoid warning messages when running only --help
-    import tensorflow as tf
-    tf.config.set_visible_devices([], device_type='GPU')  # Ensure TF does not see GPU and grab all GPU memory
+    import torch
 
     from quantum_transformers import datasets
     from quantum_transformers.quantum_layer import get_circuit
@@ -21,7 +20,7 @@ def train(config) -> None:
     from quantum_transformers.training import train_and_evaluate
 
     c = config  # Shorter alias for config
-    tf.random.set_seed(c['seed'])  # For reproducible data loading
+    torch.manual_seed(c['seed'])  # For reproducible data loading
 
     num_classes = {'imdb': 2, 'mnist': 10, 'electron-photon': 2, 'quark-gluon': 2}  # TODO: add medmnist
     model: Transformer | VisionTransformer

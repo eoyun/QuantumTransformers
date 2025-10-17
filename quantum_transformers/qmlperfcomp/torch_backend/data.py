@@ -4,6 +4,8 @@ import torch
 import torch.utils.data
 import torchvision
 
+_FLOAT32 = torch.float32
+
 from quantum_transformers.qmlperfcomp.swiss_roll import make_swiss_roll_dataset
 
 
@@ -18,8 +20,14 @@ def datasets_to_dataloaders(train_dataset: torch.utils.data.Dataset, valid_datas
 def get_swiss_roll_dataloaders(dataset_size: int = 500, train_frac: float = 0.8, **dataloader_kwargs):
     """Returns dataloaders for the Swiss roll dataset (3 features, binary classification)"""
     train_inputs, train_labels, eval_inputs, eval_labels = make_swiss_roll_dataset(n_points=dataset_size, train_frac=train_frac)
-    train_dataset = torch.utils.data.TensorDataset(torch.from_numpy(train_inputs), torch.from_numpy(train_labels))
-    valid_dataset = torch.utils.data.TensorDataset(torch.from_numpy(eval_inputs), torch.from_numpy(eval_labels))
+    train_dataset = torch.utils.data.TensorDataset(
+        torch.from_numpy(train_inputs).to(_FLOAT32),
+        torch.from_numpy(train_labels).to(torch.long),
+    )
+    valid_dataset = torch.utils.data.TensorDataset(
+        torch.from_numpy(eval_inputs).to(_FLOAT32),
+        torch.from_numpy(eval_labels).to(torch.long),
+    )
     return datasets_to_dataloaders(train_dataset, valid_dataset, **dataloader_kwargs)
 
 
